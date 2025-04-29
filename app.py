@@ -157,6 +157,19 @@ class RushesTransferApp:
             self.cache_manager.save_config()
             self.ui.show_notification(f"Source location set to: {path}", "success")
     
+    def browse_projects_dir(self):
+        """Browse for projects root directory"""
+        path = filedialog.askdirectory(title="Select Projects Root Directory")
+        if path:
+            self.destination_base_path = path
+            # Update the projects directory label
+            self.projects_dir_path.configure(text=self.destination_base_path)
+            # Save configuration after browsing
+            self.cache_manager.save_config()
+            # Refresh projects list
+            self.refresh_projects()
+            self.ui.show_notification(f"Projects location set to: {path}", "success")
+    
     def auto_detect_card(self):
         """Try to auto-detect memory card location"""
         # Try to find the memory card at standard locations

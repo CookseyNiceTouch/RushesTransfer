@@ -171,6 +171,29 @@ class UIComponents:
         )
         self.app.project_label.pack(anchor=tk.W, padx=8, pady=(8, 2))
         
+        # Projects root directory selection
+        self.app.projects_dir_frame = ctk.CTkFrame(self.app.project_frame, fg_color="transparent")
+        self.app.projects_dir_frame.pack(fill=tk.X, padx=8, pady=2)
+        
+        self.app.projects_dir_label = ctk.CTkLabel(self.app.projects_dir_frame, text="Projects Location:")
+        self.app.projects_dir_label.pack(side=tk.LEFT, padx=(0, 8))
+        
+        self.app.projects_dir_path = ctk.CTkLabel(
+            self.app.projects_dir_frame, 
+            text=self.app.destination_base_path,
+            anchor="w"
+        )
+        self.app.projects_dir_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        
+        self.app.browse_projects_button = ctk.CTkButton(
+            self.app.projects_dir_frame,
+            text="Browse",
+            command=self.app.browse_projects_dir,
+            width=80,
+            height=30
+        )
+        self.app.browse_projects_button.pack(side=tk.LEFT)
+        
         # Existing project selection
         self.app.project_select_frame = ctk.CTkFrame(self.app.project_frame, fg_color="transparent")
         self.app.project_select_frame.pack(fill=tk.X, padx=8, pady=2)
