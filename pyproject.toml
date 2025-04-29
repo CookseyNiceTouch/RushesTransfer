@@ -7,10 +7,12 @@ name = "rushestransfer"
 version = "0.1.0"
 description = "A tool to transfer video rushes from camera memory cards to project folders"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.8"
 license = {text = "MIT"}
 dependencies = [
     "customtkinter>=5.2.0",
+    "pillow>=9.0.0",
+    "opencv-python>=4.5.0",
 ]
 
 [project.scripts]
