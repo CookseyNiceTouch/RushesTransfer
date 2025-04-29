@@ -19,4 +19,7 @@ dependencies = [
 rushestransfer = "rushestransfer:main"
 
 [tool.uv]
+
+[tool.uv.workspace]
+members = ["rushestransfer"]
 # No specific configuration needed
