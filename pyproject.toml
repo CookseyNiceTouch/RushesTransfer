@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rushestransfer"
+version = "0.1.0"
+description = "A tool to transfer video rushes from camera memory cards to project folders"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+dependencies = [
+    "customtkinter>=5.2.0",
+]
+
+[project.scripts]
+rushestransfer = "rushestransfer:main"
+
+[tool.uv]
+# No specific configuration needed
