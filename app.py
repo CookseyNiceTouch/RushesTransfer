@@ -32,9 +32,9 @@ class RushesTransferApp:
         self.files_to_transfer = []
         self.selected_files = []
         
-        # Window drag detection
-        self.is_dragging = False
-        self.drag_check_interval = 100  # ms
+        # UI rate limiting to reduce CPU usage
+        self.last_ui_update_time = 0
+        self.ui_update_interval = 1000 // 120     # Target 120 fps (8.33ms)
         
         # Ensure thumbnails directory exists
         os.makedirs(self.thumbnails_dir, exist_ok=True)
@@ -60,8 +60,8 @@ class RushesTransferApp:
         # Set up event handler for when window closes
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Set up drag detection
-        self.setup_drag_detection()
+        # Rate limit UI updates to reduce CPU usage
+        self.setup_update_rate_limiting()
         
         # Automatically scan source path if available, with a delay to ensure UI is ready
         if self.source_path and os.path.exists(self.source_path):
@@ -72,6 +72,9 @@ class RushesTransferApp:
         self.ui.setup_main_ui()
         self.ui.setup_transfer_tab()
         self.ui.setup_file_selection_tab()
+        
+        # Add configure event handler to limit refresh rate during dragging
+        self.root.bind("<Configure>", self.on_configure)
         
         # Initialize projects list
         self.refresh_projects()
@@ -87,56 +90,6 @@ class RushesTransferApp:
                     self.update_destination_preview()
             except Exception as e:
                 print(f"Error setting last project: {str(e)}")
-                
-    def setup_drag_detection(self):
-        """Setup detection for window dragging to pause CPU-intensive operations"""
-        # Track last position to detect movement
-        self.last_x = self.root.winfo_x()
-        self.last_y = self.root.winfo_y()
-        
-        # Setup periodic position check
-        self.check_drag_state()
-    
-    def check_drag_state(self):
-        """Check if the window is being dragged"""
-        current_x = self.root.winfo_x()
-        current_y = self.root.winfo_y()
-        
-        # Check if position changed
-        position_changed = (current_x != self.last_x) or (current_y != self.last_y)
-        
-        # Update dragging state
-        if position_changed and not self.is_dragging:
-            # Just started dragging
-            self.is_dragging = True
-            self.pause_background_processing()
-        elif not position_changed and self.is_dragging:
-            # Just stopped dragging
-            self.is_dragging = False
-            self.resume_background_processing()
-        
-        # Update last known position
-        self.last_x = current_x
-        self.last_y = current_y
-        
-        # Schedule next check
-        self.root.after(self.drag_check_interval, self.check_drag_state)
-    
-    def pause_background_processing(self):
-        """Pause background processing during window drag"""
-        self.cache_manager.paused_for_dragging = True
-        print("Paused background processing for window dragging")
-    
-    def resume_background_processing(self):
-        """Resume background processing after window drag"""
-        if self.cache_manager.paused_for_dragging:
-            self.cache_manager.paused_for_dragging = False
-            print("Resumed background processing after window dragging")
-            
-            # If thumbnail processing was interrupted, restart if needed
-            if (self.cache_manager.thumbnail_queue.unfinished_tasks > 0 and 
-                not self.cache_manager.thumbnail_processing):
-                self.cache_manager.start_thumbnail_worker()
                 
     def initial_scan(self):
         """Scan the source path on initial load"""
@@ -393,4 +346,36 @@ class RushesTransferApp:
         self.cache_manager.save_metadata_cache()
         
         # Close the window
-        self.root.destroy() 
+        self.root.destroy()
+
+    def setup_update_rate_limiting(self):
+        """Set up rate limiting for UI updates to reduce CPU usage"""
+        # Override update_idletasks to prevent excessive updates
+        original_update_idletasks = self.root.update_idletasks
+        
+        def rate_limited_update_idletasks():
+            current_time = time.time() * 1000  # Convert to ms
+            if current_time - self.last_ui_update_time >= self.ui_update_interval:
+                self.last_ui_update_time = current_time
+                original_update_idletasks()
+                
+        self.root.update_idletasks = rate_limited_update_idletasks
+        
+        # Override update to prevent excessive updates
+        original_update = self.root.update
+        
+        def rate_limited_update():
+            current_time = time.time() * 1000  # Convert to ms
+            if current_time - self.last_ui_update_time >= self.ui_update_interval:
+                self.last_ui_update_time = current_time
+                original_update()
+                
+        self.root.update = rate_limited_update 
+
+    def on_configure(self, event):
+        """Handle window configure events (resizing, moving)"""
+        # Only process events for the main window
+        if event.widget == self.root:
+            # Small sleep to limit refresh rate during window movement
+            # This mitigates issues with high polling rate mice
+            time.sleep(0.015)  # 15ms delay helps with 1000Hz mice 

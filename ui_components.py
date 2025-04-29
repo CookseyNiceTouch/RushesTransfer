@@ -437,8 +437,101 @@ class UIComponents:
         )
         self.app.scan_button.pack(pady=(8, 0))
     
+    def add_file_entry(self, index, file_path, rel_path, mod_time, file_size):
+        """Add a file entry to the list"""
+        # Skip if we're in the middle of a tab switch to avoid UI glitches
+        if self.tab_switching:
+            return
+            
+        # Batch UI updates - create and configure widgets before adding to the UI
+        entry_frame = ctk.CTkFrame(self.app.files_list_frame)
+        
+        # Checkbox for selection
+        var = tk.BooleanVar(value=False)  # Not selected by default
+        checkbox = ctk.CTkCheckBox(
+            entry_frame, 
+            text="", 
+            variable=var,
+            onvalue=True,
+            offvalue=False,
+            width=30,
+            command=lambda p=file_path, v=var: self.app.toggle_file_selection(p, v)
+        )
+        
+        # Add thumbnail placeholder initially, then queue up for real thumbnail
+        thumb_label = ctk.CTkLabel(entry_frame, text="", image=self.app.cache_manager.placeholder_img)
+        
+        # Check if thumbnail is already in cache
+        if file_path in self.app.cache_manager.thumbnail_cache:
+            # Use cached thumbnail directly
+            thumbnail = self.app.cache_manager.thumbnail_cache[file_path]
+            thumb_label.configure(image=thumbnail)
+        else:
+            # Queue this file for thumbnail generation - no need to check for dragging now
+            self.app.cache_manager.thumbnail_queue.put((file_path, thumb_label))
+            
+            # Start the thumbnail worker if not already running
+            if not self.app.cache_manager.thumbnail_processing:
+                self.app.cache_manager.start_thumbnail_worker()
+        
+        # Filename (just the base name, not the full path)
+        filename = os.path.basename(file_path)
+        file_label = ctk.CTkLabel(
+            entry_frame, 
+            text=filename, 
+            width=200,
+            anchor="w",
+            justify="left"
+        )
+        
+        # Date modified
+        date_str = mod_time.strftime("%Y-%m-%d %H:%M")
+        date_label = ctk.CTkLabel(
+            entry_frame, 
+            text=date_str, 
+            width=150,
+            anchor="w"
+        )
+        
+        # File size
+        size_str = self.format_size(file_size)
+        size_label = ctk.CTkLabel(
+            entry_frame, 
+            text=size_str, 
+            width=80,
+            anchor="w"
+        )
+        
+        # Now pack everything - reduces layout recalculations
+        checkbox.pack(side=tk.LEFT)
+        thumb_label.pack(side=tk.LEFT, padx=4)
+        file_label.pack(side=tk.LEFT, padx=4)
+        date_label.pack(side=tk.LEFT, padx=4)
+        size_label.pack(side=tk.LEFT, padx=4)
+        
+        # Add the frame to the UI last
+        entry_frame.pack(fill=tk.X, pady=2)
+        
+        # Store entry data
+        self.app.file_entries.append({
+            "frame": entry_frame,
+            "checkbox": checkbox,
+            "var": var,
+            "file_path": file_path,
+            "rel_path": rel_path
+        })
+    
+    def format_size(self, size_bytes):
+        """Convert bytes to a human-readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0 or unit == 'GB':
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0 
+    
     def show_notification(self, message, message_type="info"):
         """Display a notification in the notification text box"""
+        # No need to skip notifications during window drag anymore
+            
         # Set color based on message type
         color_map = {
             "info": "white",
@@ -469,97 +562,12 @@ class UIComponents:
     
     def update_ui(self, progress_percentage, total_files, completed_files, status_text, time_text):
         """Update the UI with progress information"""
+        # No need to skip UI updates during window dragging anymore
+            
         def update():
             self.app.progress_bar.set(progress_percentage)
             self.app.status_label.configure(text=status_text)
             self.app.time_label.configure(text=time_text)
             self.app.files_label.configure(text=f"{completed_files}/{total_files}")
         
-        self.app.root.after(0, update)
-    
-    def add_file_entry(self, index, file_path, rel_path, mod_time, file_size):
-        """Add a file entry to the list"""
-        # Skip if we're in the middle of a tab switch to avoid UI glitches
-        if self.tab_switching:
-            return
-            
-        # Create the entry frame
-        entry_frame = ctk.CTkFrame(self.app.files_list_frame)
-        entry_frame.pack(fill=tk.X, pady=2)
-        
-        # Checkbox for selection
-        var = tk.BooleanVar(value=False)  # Not selected by default
-        checkbox = ctk.CTkCheckBox(
-            entry_frame, 
-            text="", 
-            variable=var,
-            onvalue=True,
-            offvalue=False,
-            width=30,
-            command=lambda p=file_path, v=var: self.app.toggle_file_selection(p, v)
-        )
-        checkbox.pack(side=tk.LEFT)
-        
-        # Add thumbnail placeholder initially, then queue up for real thumbnail
-        thumb_label = ctk.CTkLabel(entry_frame, text="", image=self.app.cache_manager.placeholder_img)
-        thumb_label.pack(side=tk.LEFT, padx=4)
-        
-        # Check if thumbnail is already in cache
-        if file_path in self.app.cache_manager.thumbnail_cache:
-            # Use cached thumbnail directly
-            thumbnail = self.app.cache_manager.thumbnail_cache[file_path]
-            thumb_label.configure(image=thumbnail)
-        else:
-            # Queue this file for thumbnail generation
-            self.app.cache_manager.thumbnail_queue.put((file_path, thumb_label))
-            
-            # Start the thumbnail worker if not already running
-            if not self.app.cache_manager.thumbnail_processing:
-                self.app.cache_manager.start_thumbnail_worker()
-        
-        # Filename (just the base name, not the full path)
-        filename = os.path.basename(file_path)
-        file_label = ctk.CTkLabel(
-            entry_frame, 
-            text=filename, 
-            width=200,
-            anchor="w",
-            justify="left"
-        )
-        file_label.pack(side=tk.LEFT, padx=4)
-        
-        # Date modified
-        date_str = mod_time.strftime("%Y-%m-%d %H:%M")
-        date_label = ctk.CTkLabel(
-            entry_frame, 
-            text=date_str, 
-            width=150,
-            anchor="w"
-        )
-        date_label.pack(side=tk.LEFT, padx=4)
-        
-        # File size
-        size_str = self.format_size(file_size)
-        size_label = ctk.CTkLabel(
-            entry_frame, 
-            text=size_str, 
-            width=80,
-            anchor="w"
-        )
-        size_label.pack(side=tk.LEFT, padx=4)
-        
-        # Store entry data
-        self.app.file_entries.append({
-            "frame": entry_frame,
-            "checkbox": checkbox,
-            "var": var,
-            "file_path": file_path,
-            "rel_path": rel_path
-        })
-    
-    def format_size(self, size_bytes):
-        """Convert bytes to a human-readable format"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024.0 or unit == 'GB':
-                return f"{size_bytes:.2f} {unit}"
-            size_bytes /= 1024.0 
+        self.app.root.after(0, update) 

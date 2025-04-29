@@ -20,7 +20,6 @@ class CacheManager:
         # Thumbnail processing setup
         self.thumbnail_queue = queue.Queue()
         self.thumbnail_processing = False
-        self.paused_for_dragging = False
         
         # Maximum concurrent thumbnail generation threads
         self.max_thumbnail_threads = 4
@@ -51,7 +50,9 @@ class CacheManager:
         """Start the thumbnail generation worker thread"""
         if not self.thumbnail_processing:
             self.thumbnail_processing = True
-            for _ in range(self.max_thumbnail_threads):  # Start multiple workers
+            # Reduce from 4 to 2 worker threads to lower CPU usage
+            self.max_thumbnail_threads = 2
+            for _ in range(self.max_thumbnail_threads):
                 thread = threading.Thread(target=self.thumbnail_worker, daemon=True)
                 thread.start()
     
@@ -63,11 +64,6 @@ class CacheManager:
                 
             while self.thumbnail_processing:
                 try:
-                    # If window is dragging, pause processing
-                    if self.paused_for_dragging:
-                        time.sleep(0.1)
-                        continue
-                        
                     # Get file path and label widget from queue with timeout
                     file_path, label_widget = self.thumbnail_queue.get(timeout=1.0)
                     
@@ -79,14 +75,17 @@ class CacheManager:
                     
                     # Mark task as done
                     self.thumbnail_queue.task_done()
+                    
+                    # Add small delay between processing thumbnails to reduce CPU load
+                    time.sleep(0.05)
                 except queue.Empty:
                     # No more thumbnails to process
                     if not self.thumbnail_queue.unfinished_tasks:
                         # If queue is empty and we're done with all tasks
-                        time.sleep(0.1)  # Prevent CPU thrashing
+                        time.sleep(0.2)  # Increased from 0.1 to 0.2 seconds
                 except Exception as e:
                     print(f"Error in thumbnail worker: {str(e)}")
-                    time.sleep(0.1)  # Prevent CPU thrashing on repeated errors
+                    time.sleep(0.2)  # Increased from 0.1 to 0.2 seconds
         finally:
             with self.thumbnail_thread_lock:
                 self.active_thumbnail_threads -= 1
@@ -106,6 +105,15 @@ class CacheManager:
         try:
             # Use OpenCV to capture a frame
             cap = cv2.VideoCapture(file_path)
+            
+            # Set frame position to 20% of the video to get a meaningful frame
+            if cap.isOpened():
+                # Get total frames
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                # Set position to 20% through
+                if total_frames > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * 0.2))
+            
             success, frame = cap.read()
             cap.release()  # Release the video capture resource immediately
             
@@ -113,8 +121,8 @@ class CacheManager:
                 # Convert from BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Resize to thumbnail size
-                frame = cv2.resize(frame, (70, 40))
+                # Resize to thumbnail size - use a more efficient method
+                frame = cv2.resize(frame, (70, 40), interpolation=cv2.INTER_NEAREST)
                 
                 # Convert to PIL Image
                 image = Image.fromarray(frame)

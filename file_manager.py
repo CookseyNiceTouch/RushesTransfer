@@ -76,12 +76,23 @@ class FileManager:
             new_files = 0
             deleted_files = 0
             
-            # Count total files for progress indication
+            # Track UI updates - throttle regardless of dragging
+            last_ui_update_time = time.time()
+            ui_update_interval = 0.25  # seconds
+            
+            # Count total files for progress indication - but limit time spent counting
+            start_count_time = time.time()
             total_files = 0
             for root, _, files in os.walk(source_path):
+                # No need to check for window dragging anymore
+                # Count video files in this directory
                 for file in files:
                     if os.path.splitext(file)[1].lower() in video_extensions:
                         total_files += 1
+                
+                # Limit time spent counting to max 1 second
+                if time.time() - start_count_time > 1.0:
+                    break
             
             # If forcing a scan with existing cache, prepare to check for deleted files
             existing_files_in_cache = set()
@@ -93,16 +104,21 @@ class FileManager:
             # Set of files found in current scan
             current_files = set()
             
-            # Update progress indicator
+            # Update progress indicator - throttle updates
             def update_scan_progress(current, message):
-                if total_files > 0:
-                    percentage = current / total_files
-                    self.app.root.after(0, lambda: self.app.ui.update_ui(percentage, total_files, 0, f"Scanning: {message}", "--:--"))
+                nonlocal last_ui_update_time
+                current_time = time.time()
+                if current_time - last_ui_update_time > ui_update_interval:
+                    last_ui_update_time = current_time
+                    if total_files > 0:
+                        percentage = min(0.95, current / total_files)  # Cap at 95% until done
+                        self.app.root.after(0, lambda: self.app.ui.update_ui(percentage, total_files, 0, f"Scanning: {message}", "--:--"))
             
             # Track progress
             processed_files = 0
             
             for root, _, files in os.walk(source_path):
+                # No need to check for window dragging anymore
                 for file in files:
                     # Check if it's a video file
                     ext = os.path.splitext(file)[1].lower()
@@ -113,20 +129,24 @@ class FileManager:
                         # Add to set of current files
                         current_files.add(file_path)
                         
-                        # Update progress
+                        # Update progress - throttled
                         processed_files += 1
-                        update_scan_progress(processed_files, f"{processed_files}/{total_files} - {file}")
+                        update_scan_progress(processed_files, f"{processed_files}/{total_files}")
                         
                         # Get fresh file info if forcing a scan or if not in cache
                         if force_scan or not self.app.cache_manager.is_file_in_cache(file_path):
-                            # Get file info without opening the file
-                            file_stat = os.stat(file_path)
-                            mod_time = datetime.fromtimestamp(file_stat.st_mtime)
-                            file_size = file_stat.st_size
-                            
-                            # Add to cache
-                            self.app.cache_manager.add_file_to_metadata_cache(file_path, rel_path, mod_time, file_size)
-                            new_files += 1
+                            try:
+                                # Get file info without opening the file
+                                file_stat = os.stat(file_path)
+                                mod_time = datetime.fromtimestamp(file_stat.st_mtime)
+                                file_size = file_stat.st_size
+                                
+                                # Add to cache
+                                self.app.cache_manager.add_file_to_metadata_cache(file_path, rel_path, mod_time, file_size)
+                                new_files += 1
+                            except Exception as e:
+                                print(f"Error getting stats for {file_path}: {str(e)}")
+                                continue
                         else:
                             # Use cached metadata
                             cached_data = self.app.cache_manager.file_metadata_cache[file_path]
@@ -216,9 +236,10 @@ class FileManager:
     
     def update_ui_with_file_list(self, file_list, cache_hits=0, new_files=0, message=None):
         """Update the UI with a list of files, using batching for performance"""
-        batch_size = 20  # Display files in batches
+        batch_size = 10  # Smaller batch size (was 20) for more responsive UI
         
         def update_ui_batch(batch_start, files_added=0):
+            # No need to check for dragging anymore - the Configure event handler takes care of this
             end_index = min(batch_start + batch_size, len(file_list))
             current_batch = file_list[batch_start:end_index]
             
@@ -230,29 +251,31 @@ class FileManager:
             
             # Add batch to UI
             for i, (file_path, rel_path, mod_time, file_size) in enumerate(current_batch):
-                # Check if we're dragging window - pause UI updates during drag
-                if self.app.is_dragging:
-                    # Resume from this point after dragging stops
-                    self.app.root.after(50, lambda: update_ui_batch(batch_start, files_added))
-                    return
-                
                 self.app.ui.add_file_entry(batch_start + i, file_path, rel_path, mod_time, file_size)
                 files_added += 1
                 
-                # Update progress while adding files
-                percentage = 1.0 if len(file_list) == 0 else files_added / len(file_list)
-                self.app.ui.update_ui(percentage, len(file_list), 0, f"Loading files: {files_added}/{len(file_list)}", "--:--")
+                # Update progress less frequently while adding files
+                if files_added % 5 == 0:
+                    percentage = 1.0 if len(file_list) == 0 else files_added / len(file_list)
+                    self.app.ui.update_ui(percentage, len(file_list), 0, f"Loading files: {files_added}/{len(file_list)}", "--:--")
+                
+                # Small delay between files for more responsive UI
+                self.app.root.update_idletasks()
             
-            # Schedule next batch if needed
+            # Schedule next batch if needed - longer pause between batches
             if end_index < len(file_list):
-                self.app.root.after(5, lambda: update_ui_batch(end_index, files_added))
+                self.app.root.after(10, lambda: update_ui_batch(end_index, files_added))
             else:
                 # All batches done
-                cache_message = message or f"Found {len(self.app.files_to_transfer)} video files (Cache: {cache_hits} hits, {new_files} new)"
-                self.app.ui.show_notification(cache_message, "success")
+                if message:
+                    self.app.ui.show_notification(message, "success")
+                else:
+                    self.app.ui.show_notification(f"Found {len(file_list)} video files", "success")
+                
+                # Update UI with final state
+                self.app.ui.update_ui(1.0, len(file_list), 0, "Ready", "--:--")
                 self.app.status_label.configure(text="Ready")
                 self.scanning_in_progress = False
-                self.app.ui.update_ui(0, 0, 0, "Ready", "--:--")
         
         # Start the batch update process with shorter delay
         self.app.root.after(0, lambda: update_ui_batch(0))
