@@ -13,10 +13,18 @@ import cv2
 import io
 from pathlib import Path
 import queue
+import base64
 
 # Set appearance mode and default color theme
 ctk.set_appearance_mode("dark")  # Options: "Dark", "Light", "System"
 ctk.set_default_color_theme("blue")  # Options: "blue", "green", "dark-blue"
+
+# Helper function to make datetime objects JSON serializable
+def datetime_serializer(obj):
+    """Convert datetime objects to ISO format strings for JSON serialization"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
 
 class RushesTransferApp:
     def __init__(self, root):
@@ -34,14 +42,32 @@ class RushesTransferApp:
         self.current_file_transferred = 0
         self.transfer_start_time = 0
         self.config_file = "rushes_transfer_config.json"
+        self.metadata_cache_file = "rushes_transfer_metadata_cache.json"
+        self.thumbnails_dir = "thumbnails"
         self.config_loaded = False
         self.files_to_transfer = []
         self.selected_files = []
         self.thumbnail_cache = {}
+        self.file_metadata_cache = {}
+        
+        # Window drag detection
+        self.is_dragging = False
+        self.drag_check_interval = 100  # ms
+        
+        # Ensure thumbnails directory exists
+        os.makedirs(self.thumbnails_dir, exist_ok=True)
         
         # Thumbnail queue and worker thread
         self.thumbnail_queue = queue.Queue()
         self.thumbnail_processing = False
+        self.tab_switching = False
+        self.scanning_in_progress = False
+        
+        # Maximum concurrent thumbnail generation threads
+        self.max_thumbnail_threads = 4
+        self.active_thumbnail_threads = 0
+        self.thumbnail_thread_lock = threading.Lock()
+        self.paused_for_dragging = False
         
         # Create a placeholder thumbnail for use while loading
         self.placeholder_img = self.create_placeholder_thumbnail()
@@ -54,6 +80,7 @@ class RushesTransferApp:
         
         # Load configuration before setting up UI
         self.load_config()
+        self.load_metadata_cache()
         
         # Setup UI
         self.setup_ui()
@@ -61,9 +88,70 @@ class RushesTransferApp:
         # Set up event handler for when window closes
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Automatically scan source path if available
+        # Set up drag detection
+        self.setup_drag_detection()
+        
+        # Automatically scan source path if available, with a delay to ensure UI is ready
         if self.source_path and os.path.exists(self.source_path):
-            self.root.after(500, self.scan_files)
+            # Use a longer delay for initial scan to ensure UI is fully loaded
+            self.root.after(1000, self.initial_scan)
+    
+    def setup_drag_detection(self):
+        """Setup detection for window dragging to pause CPU-intensive operations"""
+        # Track last position to detect movement
+        self.last_x = self.root.winfo_x()
+        self.last_y = self.root.winfo_y()
+        
+        # Setup periodic position check
+        self.check_drag_state()
+    
+    def check_drag_state(self):
+        """Check if the window is being dragged"""
+        current_x = self.root.winfo_x()
+        current_y = self.root.winfo_y()
+        
+        # Check if position changed
+        position_changed = (current_x != self.last_x) or (current_y != self.last_y)
+        
+        # Update dragging state
+        if position_changed and not self.is_dragging:
+            # Just started dragging
+            self.is_dragging = True
+            self.pause_background_processing()
+        elif not position_changed and self.is_dragging:
+            # Just stopped dragging
+            self.is_dragging = False
+            self.resume_background_processing()
+        
+        # Update last known position
+        self.last_x = current_x
+        self.last_y = current_y
+        
+        # Schedule next check
+        self.root.after(self.drag_check_interval, self.check_drag_state)
+    
+    def pause_background_processing(self):
+        """Pause background processing during window drag"""
+        self.paused_for_dragging = True
+        print("Paused background processing for window dragging")
+    
+    def resume_background_processing(self):
+        """Resume background processing after window drag"""
+        if self.paused_for_dragging:
+            self.paused_for_dragging = False
+            print("Resumed background processing after window dragging")
+            
+            # If thumbnail processing was interrupted, restart if needed
+            if self.thumbnail_queue.unfinished_tasks > 0 and not self.thumbnail_processing:
+                self.start_thumbnail_worker()
+    
+    def initial_scan(self):
+        """Scan the source path on initial load"""
+        if self.source_path and os.path.exists(self.source_path):
+            # Set source in entry if not already set
+            if not self.source_entry.get():
+                self.source_entry.insert(0, self.source_path)
+            self.scan_files()
     
     def setup_ui(self):
         # Main frame that fills the window
@@ -85,6 +173,40 @@ class RushesTransferApp:
         # Create tabs
         self.tab_view.add("Transfer")
         self.tab_view.add("File Selection")
+        
+        # Track tab switching to optimize performance - using callback instead of overriding
+        # Set up a callback for when tabs change
+        def on_tab_change(*args):
+            self.tab_switching = True
+            # Schedule a reset of the switching flag after UI updates
+            self.root.after(100, self.finish_tab_switch)
+        
+        # Store the current tab to detect changes
+        self.current_tab = "Transfer"
+        
+        # Override the set method on the tab view to track tab changes
+        original_set = self.tab_view.set
+        
+        def tracked_set(name):
+            if name != self.current_tab:
+                self.tab_switching = True
+                self.current_tab = name
+                self.root.after(100, self.finish_tab_switch)
+            return original_set(name)
+            
+        self.tab_view.set = tracked_set
+        
+        # Try to bind to tab change event by hooking into the underlying tkinter event
+        notebook_found = False
+        for child in self.tab_view.winfo_children():
+            if isinstance(child, ctk.CTkFrame) and hasattr(child, 'winfo_children'):
+                for subchild in child.winfo_children():
+                    if isinstance(subchild, tk.ttk.Notebook):
+                        subchild.bind("<<NotebookTabChanged>>", on_tab_change)
+                        notebook_found = True
+                        break
+                if notebook_found:
+                    break
         
         # Transfer tab content - Using direct content instead of moving existing panel
         self.transfer_tab = self.tab_view.tab("Transfer")
@@ -404,11 +526,21 @@ class RushesTransferApp:
         # Add scan button at the bottom
         self.scan_button = ctk.CTkButton(
             self.files_frame,
-            text="Scan Source Directory",
+            text="Rescan Source Directory",
             command=self.scan_files,
             height=36
         )
         self.scan_button.pack(pady=(8, 0))
+        
+        # Add thumbnail management - keep only the clear thumbnails button
+        self.clear_thumbs_button = ctk.CTkButton(
+            self.files_header_frame,
+            text="Clear Thumbnails",
+            command=self.clear_thumbnails,
+            width=120,
+            height=30
+        )
+        self.clear_thumbs_button.pack(side=tk.RIGHT, padx=10)
         
         # Initialize projects list
         self.refresh_projects()
@@ -468,18 +600,27 @@ class RushesTransferApp:
         """Start the thumbnail generation worker thread"""
         if not self.thumbnail_processing:
             self.thumbnail_processing = True
-            thread = threading.Thread(target=self.thumbnail_worker, daemon=True)
-            thread.start()
+            for _ in range(self.max_thumbnail_threads):  # Start multiple workers
+                thread = threading.Thread(target=self.thumbnail_worker, daemon=True)
+                thread.start()
     
     def thumbnail_worker(self):
         """Worker thread to process thumbnails in background"""
         try:
+            with self.thumbnail_thread_lock:
+                self.active_thumbnail_threads += 1
+                
             while self.thumbnail_processing:
                 try:
+                    # If window is dragging, pause processing
+                    if self.paused_for_dragging:
+                        time.sleep(0.1)
+                        continue
+                        
                     # Get file path and label widget from queue with timeout
                     file_path, label_widget = self.thumbnail_queue.get(timeout=1.0)
                     
-                    # Generate thumbnail
+                    # Generate thumbnail (will check disk cache first)
                     thumbnail = self.generate_thumbnail(file_path)
                     
                     # Update label in main thread
@@ -496,12 +637,20 @@ class RushesTransferApp:
                     print(f"Error in thumbnail worker: {str(e)}")
                     time.sleep(0.1)  # Prevent CPU thrashing on repeated errors
         finally:
-            self.thumbnail_processing = False
+            with self.thumbnail_thread_lock:
+                self.active_thumbnail_threads -= 1
+                if self.active_thumbnail_threads == 0:
+                    self.thumbnail_processing = False
     
     def generate_thumbnail(self, file_path):
         """Generate a thumbnail for the given video file"""
         if file_path in self.thumbnail_cache:
             return self.thumbnail_cache[file_path]
+        
+        # Check if we have a saved thumbnail on disk
+        disk_thumbnail = self.load_thumbnail_from_disk(file_path)
+        if disk_thumbnail:
+            return disk_thumbnail
             
         try:
             # Use OpenCV to capture a frame
@@ -519,11 +668,18 @@ class RushesTransferApp:
                 # Convert to PIL Image
                 image = Image.fromarray(frame)
                 
+                # Save the thumbnail to disk for future use
+                self.save_thumbnail_to_disk(file_path, image)
+                
                 # Convert to CTkImage for proper scaling
                 ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=(70, 40))
                 
                 # Store in cache
                 self.thumbnail_cache[file_path] = ctk_image
+                
+                # Update metadata to indicate thumbnail exists
+                if file_path in self.file_metadata_cache:
+                    self.file_metadata_cache[file_path]['has_thumbnail'] = True
                 
                 # Return the image
                 return ctk_image
@@ -575,7 +731,13 @@ class RushesTransferApp:
         if not source_path or not os.path.exists(source_path):
             self.show_notification("Please select a valid source folder", "warning")
             return
+        
+        # Check if scanning is already in progress
+        if self.scanning_in_progress:
+            self.show_notification("File scanning already in progress", "warning")
+            return
             
+        self.scanning_in_progress = True
         self.source_path = source_path
         self.show_notification(f"Scanning {source_path} for video files...", "info")
         
@@ -585,15 +747,55 @@ class RushesTransferApp:
         # Reset files to transfer
         self.files_to_transfer = []
         
-        # Start scan in a background thread to keep UI responsive
-        threading.Thread(target=self.scan_files_thread, args=(source_path,), daemon=True).start()
+        # Show scanning indicator
+        self.status_label.configure(text="Scanning files...")
+        
+        # Switch to the file selection tab first, before scanning
+        # This avoids the UI freeze when switching tabs after a scan
+        self.tab_view.set("File Selection")
+        
+        # A small delay to ensure tab switch completes before scanning starts
+        def delayed_scan():
+            # Start scan in a background thread to keep UI responsive
+            threading.Thread(target=self.scan_files_thread, args=(source_path,), daemon=True).start()
+            
+        self.root.after(50, delayed_scan)
     
     def scan_files_thread(self, source_path):
         """Background thread for scanning files"""
         try:
+            # Check if we already have a good cache for this directory
+            if self.has_valid_cache_for_directory(source_path):
+                self.show_notification("Using cached file information for faster loading", "info")
+                
+                # Use fast path for existing cache
+                self.use_cached_file_list(source_path)
+                return
+            
+            # Otherwise, do a full scan
             # Find all video files
             file_list = []
             video_extensions = ['.mp4', '.mov', '.avi', '.mxf', '.m4v']
+            
+            # Track cache hits and new files for stats
+            cache_hits = 0
+            new_files = 0
+            
+            # Count total files for progress indication
+            total_files = 0
+            for root, _, files in os.walk(source_path):
+                for file in files:
+                    if os.path.splitext(file)[1].lower() in video_extensions:
+                        total_files += 1
+            
+            # Update progress indicator
+            def update_scan_progress(current, message):
+                if total_files > 0:
+                    percentage = current / total_files
+                    self.root.after(0, lambda: self.update_ui(percentage, total_files, 0, f"Scanning: {message}", "--:--"))
+            
+            # Track progress
+            processed_files = 0
             
             for root, _, files in os.walk(source_path):
                 for file in files:
@@ -603,10 +805,30 @@ class RushesTransferApp:
                         file_path = os.path.join(root, file)
                         rel_path = os.path.relpath(file_path, source_path)
                         
-                        # Get file info without opening the file
-                        file_stat = os.stat(file_path)
-                        mod_time = datetime.fromtimestamp(file_stat.st_mtime)
-                        file_size = file_stat.st_size
+                        # Update progress
+                        processed_files += 1
+                        update_scan_progress(processed_files, f"{processed_files}/{total_files} - {file}")
+                        
+                        # Check if we already have this file in the cache
+                        if self.is_file_in_cache(file_path):
+                            # Use cached metadata
+                            cached_data = self.file_metadata_cache[file_path]
+                            mod_time = cached_data['mod_time']
+                            file_size = cached_data['file_size']
+                            cache_hits += 1
+                        else:
+                            # Get file info without opening the file
+                            file_stat = os.stat(file_path)
+                            mod_time = datetime.fromtimestamp(file_stat.st_mtime)
+                            file_size = file_stat.st_size
+                            
+                            # Add to cache
+                            self.add_file_to_metadata_cache(file_path, rel_path, mod_time, file_size)
+                            new_files += 1
+                        
+                        # Track the source directory in the metadata
+                        if file_path in self.file_metadata_cache:
+                            self.file_metadata_cache[file_path]['source_dir'] = source_path
                         
                         # Add to list
                         file_list.append((file_path, rel_path, mod_time, file_size))
@@ -614,33 +836,113 @@ class RushesTransferApp:
             # Sort by modification time (newest first)
             file_list.sort(key=lambda x: x[2], reverse=True)
             
-            # Update UI in main thread
-            def update_ui():
-                # Store the files in instance variable
-                self.files_to_transfer = file_list
-                
-                # Files are not selected by default
-                self.selected_files = []
-                self.select_all_var.set(False)
-                
-                # Add to UI
-                for i, (file_path, rel_path, mod_time, file_size) in enumerate(self.files_to_transfer):
-                    self.add_file_entry(i, file_path, rel_path, mod_time, file_size)
-                
-                # Update status
-                self.show_notification(f"Found {len(self.files_to_transfer)} video files", "success")
-                self.tab_view.set("File Selection")  # Switch to file selection tab
-                
-            # Schedule UI update in main thread
-            self.root.after(0, update_ui)
+            # Save the updated metadata cache
+            self.save_metadata_cache()
+            
+            # Update UI in main thread - process in batches for better performance
+            self.update_ui_with_file_list(file_list, cache_hits, new_files)
             
         except Exception as e:
             def show_error():
                 self.show_notification(f"Error scanning files: {str(e)}", "error")
+                self.scanning_in_progress = False
+                self.status_label.configure(text="Error scanning files")
             self.root.after(0, show_error)
+    
+    def has_valid_cache_for_directory(self, source_path):
+        """Check if we have a valid cached file list for this directory"""
+        # If cache is empty, definitely not valid
+        if not self.file_metadata_cache:
+            return False
+            
+        # Check for files from this source directory
+        source_dir_files = [
+            path for path, data in self.file_metadata_cache.items() 
+            if data.get('source_dir') == source_path and os.path.exists(path)
+        ]
+        
+        # If we have a good number of files from this directory
+        return len(source_dir_files) > 0
+    
+    def use_cached_file_list(self, source_path):
+        """Use the cached file list for faster loading"""
+        try:
+            # Get all files from this source directory
+            cached_files = []
+            for file_path, data in self.file_metadata_cache.items():
+                if data.get('source_dir') == source_path and os.path.exists(file_path):
+                    try:
+                        rel_path = data.get('rel_path', '')
+                        mod_time = data.get('mod_time')
+                        file_size = data.get('file_size', 0)
+                        cached_files.append((file_path, rel_path, mod_time, file_size))
+                    except Exception as e:
+                        print(f"Error processing cached file {file_path}: {str(e)}")
+            
+            # Skip files that no longer exist
+            valid_files = [(path, rel, mod, size) for path, rel, mod, size in cached_files if os.path.exists(path)]
+            
+            # Sort by modification time (newest first)
+            valid_files.sort(key=lambda x: x[2], reverse=True)
+            
+            # Update UI with this list - much faster than scanning
+            self.update_ui_with_file_list(valid_files, len(valid_files), 0, "Using cached file list")
+            
+        except Exception as e:
+            # Fall back to full scan if cache fails
+            print(f"Error using cached file list: {str(e)}")
+            # Start a full scan
+            self.scan_files_thread(source_path)
+    
+    def update_ui_with_file_list(self, file_list, cache_hits=0, new_files=0, message=None):
+        """Update the UI with a list of files, using batching for performance"""
+        batch_size = 20  # Display files in batches
+        
+        def update_ui_batch(batch_start, files_added=0):
+            end_index = min(batch_start + batch_size, len(file_list))
+            current_batch = file_list[batch_start:end_index]
+            
+            # Files are not selected by default
+            if batch_start == 0:  # Only on first batch
+                self.files_to_transfer = file_list
+                self.selected_files = []
+                self.select_all_var.set(False)
+            
+            # Add batch to UI
+            for i, (file_path, rel_path, mod_time, file_size) in enumerate(current_batch):
+                # Check if we're dragging window - pause UI updates during drag
+                if self.is_dragging:
+                    # Resume from this point after dragging stops
+                    self.root.after(50, lambda: update_ui_batch(batch_start, files_added))
+                    return
+                
+                self.add_file_entry(batch_start + i, file_path, rel_path, mod_time, file_size)
+                files_added += 1
+                
+                # Update progress while adding files
+                percentage = 1.0 if len(file_list) == 0 else files_added / len(file_list)
+                self.update_ui(percentage, len(file_list), 0, f"Loading files: {files_added}/{len(file_list)}", "--:--")
+            
+            # Schedule next batch if needed
+            if end_index < len(file_list):
+                self.root.after(5, lambda: update_ui_batch(end_index, files_added))
+            else:
+                # All batches done
+                cache_message = message or f"Found {len(self.files_to_transfer)} video files (Cache: {cache_hits} hits, {new_files} new)"
+                self.show_notification(cache_message, "success")
+                self.status_label.configure(text="Ready")
+                self.scanning_in_progress = False
+                self.update_ui(0, 0, 0, "Ready", "--:--")
+        
+        # Start the batch update process with shorter delay
+        self.root.after(0, lambda: update_ui_batch(0))
     
     def add_file_entry(self, index, file_path, rel_path, mod_time, file_size):
         """Add a file entry to the list"""
+        # Skip if we're in the middle of a tab switch to avoid UI glitches
+        if self.tab_switching:
+            return
+            
         # Create the entry frame
         entry_frame = ctk.CTkFrame(self.files_list_frame)
         entry_frame.pack(fill=tk.X, pady=2)
@@ -662,12 +964,18 @@ class RushesTransferApp:
         thumb_label = ctk.CTkLabel(entry_frame, text="", image=self.placeholder_img)
         thumb_label.pack(side=tk.LEFT, padx=4)
         
-        # Queue this file for thumbnail generation
-        self.thumbnail_queue.put((file_path, thumb_label))
-        
-        # Start the thumbnail worker if not already running
-        if not self.thumbnail_processing:
-            self.start_thumbnail_worker()
+        # Check if thumbnail is already in cache
+        if file_path in self.thumbnail_cache:
+            # Use cached thumbnail directly
+            thumbnail = self.thumbnail_cache[file_path]
+            thumb_label.configure(image=thumbnail)
+        else:
+            # Queue this file for thumbnail generation
+            self.thumbnail_queue.put((file_path, thumb_label))
+            
+            # Start the thumbnail worker if not already running
+            if not self.thumbnail_processing:
+                self.start_thumbnail_worker()
         
         # Filename (just the base name, not the full path)
         filename = os.path.basename(file_path)
@@ -926,8 +1234,9 @@ class RushesTransferApp:
             self.show_notification("A transfer is in progress. Click Cancel first before closing.", "warning")
             return
         
-        # Save current configuration
+        # Save current configuration and metadata cache
         self.save_config()
+        self.save_metadata_cache()
         
         # Close the window
         self.root.destroy()
@@ -1169,6 +1478,160 @@ class RushesTransferApp:
             self.cancel_button.configure(state="disabled")
             # Show message in notification area instead of popup
             self.show_notification("Transfer is being cancelled. Any partially transferred files will be deleted.", "warning")
+    
+    def finish_tab_switch(self):
+        """Called after tab switching to reset the flag"""
+        self.tab_switching = False
+        # Force a UI update
+        self.root.update_idletasks()
+    
+    def load_metadata_cache(self):
+        """Load file metadata cache from disk"""
+        try:
+            if os.path.exists(self.metadata_cache_file):
+                print(f"Loading metadata cache from {self.metadata_cache_file}")
+                with open(self.metadata_cache_file, 'r') as f:
+                    cached_data = json.load(f)
+                    
+                # Process the loaded data
+                self.file_metadata_cache = {}
+                for file_path, data in cached_data.items():
+                    # Convert string dates back to datetime objects
+                    if 'mod_time' in data:
+                        try:
+                            data['mod_time'] = datetime.fromisoformat(data['mod_time'])
+                        except Exception as e:
+                            print(f"Error converting date: {e}")
+                            # If conversion fails, use current time
+                            data['mod_time'] = datetime.now()
+                            
+                    if 'last_checked' in data:
+                        try:
+                            data['last_checked'] = datetime.fromisoformat(data['last_checked'])
+                        except Exception as e:
+                            print(f"Error converting last_checked date: {e}")
+                            # If conversion fails, use current time
+                            data['last_checked'] = datetime.now()
+                            
+                    self.file_metadata_cache[file_path] = data
+                    
+                print(f"Loaded metadata for {len(self.file_metadata_cache)} files")
+        except Exception as e:
+            print(f"Error loading metadata cache: {str(e)}")
+            self.file_metadata_cache = {}
+    
+    def save_metadata_cache(self):
+        """Save file metadata cache to disk"""
+        try:
+            # Convert the cache to a serializable format
+            serializable_cache = {}
+            for file_path, data in self.file_metadata_cache.items():
+                serializable_data = data.copy()
+                # Using the custom serializer function won't work for the whole dictionary
+                # So we need to convert datetime objects manually
+                if 'mod_time' in serializable_data and isinstance(serializable_data['mod_time'], datetime):
+                    serializable_data['mod_time'] = serializable_data['mod_time'].isoformat()
+                if 'last_checked' in serializable_data and isinstance(serializable_data['last_checked'], datetime):
+                    serializable_data['last_checked'] = serializable_data['last_checked'].isoformat()
+                serializable_cache[file_path] = serializable_data
+                
+            with open(self.metadata_cache_file, 'w') as f:
+                json.dump(serializable_cache, f, indent=4)
+                
+            print(f"Saved metadata for {len(self.file_metadata_cache)} files")
+        except Exception as e:
+            print(f"Error saving metadata cache: {str(e)}")
+    
+    def refresh_file_cache(self):
+        """Clear the file metadata cache and rescan"""
+        self.file_metadata_cache = {}  # Clear the metadata cache
+        self.thumbnail_cache = {}      # Clear the thumbnail cache
+        
+        # Ask if user wants to clear disk thumbnails as well
+        self.show_notification("Clearing cache and rescanning files...", "info")
+        
+        # Start a new scan
+        self.scan_files()
+    
+    def clear_thumbnails(self):
+        """Clear all thumbnails from disk"""
+        try:
+            for file in os.listdir(self.thumbnails_dir):
+                file_path = os.path.join(self.thumbnails_dir, file)
+                if os.path.isfile(file_path) and file.endswith('.png'):
+                    os.remove(file_path)
+            self.show_notification("All thumbnails cleared from disk", "info")
+        except Exception as e:
+            self.show_notification(f"Error clearing thumbnails: {str(e)}", "error")
+    
+    def add_file_to_metadata_cache(self, file_path, rel_path, mod_time, file_size):
+        """Add or update a file in the metadata cache"""
+        self.file_metadata_cache[file_path] = {
+            'rel_path': rel_path,
+            'mod_time': mod_time,
+            'file_size': file_size,
+            'last_checked': datetime.now(),
+            'has_thumbnail': os.path.exists(self.get_thumbnail_path(file_path))
+        }
+    
+    def is_file_in_cache(self, file_path):
+        """Check if a file is in the metadata cache and if its metadata is still valid"""
+        if file_path in self.file_metadata_cache:
+            cached_data = self.file_metadata_cache[file_path]
+            
+            # Check if the file still exists
+            if not os.path.exists(file_path):
+                return False
+                
+            # Check if the file size has changed
+            try:
+                current_size = os.path.getsize(file_path)
+                if current_size != cached_data.get('file_size', 0):
+                    return False
+                    
+                # Check if modified time has changed
+                current_mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                cached_mod_time = cached_data.get('mod_time')
+                
+                if cached_mod_time and abs((current_mod_time - cached_mod_time).total_seconds()) > 2:
+                    return False
+                    
+                return True
+            except:
+                return False
+        return False
+    
+    def get_thumbnail_path(self, file_path):
+        """Generate a unique path for the thumbnail file based on the source file path"""
+        # Create a hash of the file path to use as the filename
+        file_hash = hashlib.md5(file_path.encode()).hexdigest()
+        return os.path.join(self.thumbnails_dir, f"{file_hash}.png")
+    
+    def save_thumbnail_to_disk(self, file_path, image):
+        """Save a thumbnail to disk"""
+        try:
+            thumbnail_path = self.get_thumbnail_path(file_path)
+            image.save(thumbnail_path, "PNG")
+            return True
+        except Exception as e:
+            print(f"Error saving thumbnail to disk: {str(e)}")
+            return False
+    
+    def load_thumbnail_from_disk(self, file_path):
+        """Load a thumbnail from disk if it exists"""
+        thumbnail_path = self.get_thumbnail_path(file_path)
+        if os.path.exists(thumbnail_path):
+            try:
+                # Load the image from disk
+                pil_image = Image.open(thumbnail_path)
+                # Convert to CTkImage
+                ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(70, 40))
+                # Store in cache and return
+                self.thumbnail_cache[file_path] = ctk_image
+                return ctk_image
+            except Exception as e:
+                print(f"Error loading thumbnail from disk: {str(e)}")
+        return None
 
 
 def main():
